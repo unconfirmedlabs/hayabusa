@@ -1,0 +1,25 @@
+# deps
+node_modules/
+
+# build
+dist/
+.wrangler/
+
+# config (lives outside repo)
+wrangler.jsonc
+src/config.json
+
+# env
+.env
+.env.*
+.dev.vars
+
+# logs
+*.log
+
+# os
+.DS_Store
+
+# editor
+.vscode/
+.idea/

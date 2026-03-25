@@ -1,0 +1,18 @@
+{
+  "name": "hayabusa",
+  "type": "module",
+  "scripts": {
+    "sync-config": "bun scripts/sync-config.ts",
+    "dev": "bun run sync-config && wrangler dev --config ~/Documents/sona/hayabusa/wrangler.jsonc",
+    "deploy": "bun run sync-config && wrangler deploy --minify --config ~/Documents/sona/hayabusa/wrangler.jsonc",
+    "cf-typegen": "wrangler types --env-interface CloudflareBindings --config ~/Documents/sona/hayabusa/wrangler.jsonc"
+  },
+  "dependencies": {
+    "hono": "^4.12.9",
+    "p-retry": "^7.1.1",
+    "p-timeout": "^7.0.1"
+  },
+  "devDependencies": {
+    "wrangler": "^4.4.0"
+  }
+}
