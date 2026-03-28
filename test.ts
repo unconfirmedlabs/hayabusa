@@ -1,3 +1,5 @@
+export {};
+
 const BASE = 'http://localhost:8788';
 
 // Empty gRPC-Web frame (5 bytes: 0x00 flag + 4 bytes zero length)

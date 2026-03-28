@@ -21,11 +21,51 @@ This is fully transparent to the client — any Sui SDK or gRPC-Web client works
 ## Features
 
 - **Request racing** — fan out to N backends, return the fastest response, abort the rest
-- **Protocol transparent** — forwards gRPC-Web requests as-is, no protobuf parsing
-- **Usage analytics** — logs every request to Cloudflare Analytics Engine with method, latency, geo, and hashed client IP
+- **Edge caching** — immutable gRPC responses cached at Cloudflare's edge via Cache API + `cache-control: immutable`
+- **Header sanitization** — only gRPC protocol headers forwarded from backends, stripping node-specific and infrastructure headers
+- **Usage analytics** — logs every request to Cloudflare Analytics Engine with method, latency, geo, and cache status
 - **Latency endpoint** — `GET /latency` pings all backends and reports timing
 - **CORS** — browser-ready out of the box
-- **Zero runtime dependencies** — just [Hono](https://hono.dev) on Cloudflare Workers
+
+## Caching
+
+Sui's gRPC API has several methods that return permanently immutable data. Hayabusa caches these at the Cloudflare edge using two layers:
+
+1. **CF Cache API** — caches responses in the local datacenter, keyed on URL path + SHA-256 of the request body
+2. **`cache-control: public, max-age=31536000, immutable`** — enables downstream browser and proxy caching
+
+### Cached methods
+
+**Tier 1 — always immutable** (no request inspection needed):
+
+| Method | Why immutable |
+|--------|--------------|
+| `LedgerService/GetTransaction` | Content-addressed by digest |
+| `LedgerService/BatchGetTransactions` | Content-addressed by digest |
+| `MovePackageService/GetPackage` | Package storage IDs are immutable once published |
+| `MovePackageService/GetDatatype` | Datatype definitions within a package never change |
+| `MovePackageService/GetFunction` | Function definitions within a package never change |
+
+**Tier 2 — conditionally immutable** (inspects protobuf request body):
+
+| Method | Cached when |
+|--------|------------|
+| `LedgerService/GetObject` | `version` field is set (object at a specific version is frozen) |
+| `LedgerService/GetCheckpoint` | `sequence_number` or `digest` is provided (not "latest") |
+
+Tier 2 uses a minimal protobuf wire format scanner (~30 lines, zero dependencies) to check for the presence of version-pinning fields. Only successful gRPC responses (`grpc-status: 0`) are cached. Errors are never stored.
+
+### Performance
+
+Cache hits are served directly from the Cloudflare edge datacenter with no backend calls:
+
+| Scenario | Latency | Speedup |
+|----------|---------|---------|
+| Uncached (racing 5 backends) | 92–264ms | baseline |
+| Cache MISS (first request) | 99–302ms | — |
+| Cache HIT | 2–5ms | **~50x faster** |
+
+Measured from `x-hayabusa-latency` header on `hayabusa.testnet.miso.network` (KIX datacenter → testnet fullnodes).
 
 ## Response headers
 
@@ -33,8 +73,9 @@ Every proxied response includes:
 
 | Header | Description |
 |--------|-------------|
-| `x-hayabusa-backend` | SHA-256 hash (16 chars) of the winning backend URL |
+| `x-hayabusa-backend` | SHA-256 hash (16 chars) of the winning backend URL (empty on cache hit) |
 | `x-hayabusa-latency` | Total proxy latency in milliseconds |
+| `x-hayabusa-cache` | `HIT` or `MISS` (only present on cacheable methods) |
 
 ## Endpoints
 
@@ -136,7 +177,8 @@ Every proxied request logs a data point to Cloudflare Analytics Engine:
 | blob8 | ASN organization |
 | blob9 | HTTP protocol |
 | blob10 | TLS version |
-| blob11 | Winning backend hash |
+| blob11 | Winning backend hash (empty on cache hit) |
+| blob12 | Cache status (`HIT`, `MISS`, or empty for non-cacheable) |
 | double1 | Response latency (ms) |
 | double2 | ASN number |
 | double3 | Client RTT (ms) |
