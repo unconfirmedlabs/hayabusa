@@ -8,7 +8,6 @@
   },
   "dependencies": {
     "hono": "^4.12.9",
-    "p-retry": "^7.1.1",
     "p-timeout": "^7.0.1"
   },
   "devDependencies": {

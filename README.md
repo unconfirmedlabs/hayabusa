@@ -4,14 +4,14 @@ A Sui gRPC proxy that races requests to multiple backend fullnodes and returns t
 
 ## How it works
 
-Sui's gRPC API uses the [gRPC-Web](https://github.com/grpc/grpc-web) protocol — standard HTTP POST requests with binary protobuf bodies. Hayabusa exploits this by fanning out every incoming request to all configured backends simultaneously using `Promise.any`. The first successful response wins; the rest are aborted via `AbortController`.
+Sui's gRPC API uses the [gRPC-Web](https://github.com/grpc/grpc-web) protocol — standard HTTP POST requests with binary protobuf bodies. Hayabusa tracks backend health over time and races requests to the fastest backends using `Promise.any`. The first successful response wins; the rest are aborted via `AbortController`.
 
 ```
-Client (Sui SDK) ──gRPC-Web──▶ Hayabusa (CF Worker) ──┬──▶ Backend A
-                                      │                ├──▶ Backend B
-                                      │                └──▶ Backend C
-                                      │                       │
-                                      │◀── fastest response ──┘
+Client (Sui SDK) ──gRPC-Web──▶ Hayabusa (CF Worker) ──┬──▶ Primary pool (top 3)
+                                      │                │     fastest response ──┐
+                                      │                └──▶ Fallback pool       │
+                                      │                     (if primary fails)  │
+                                      │◀────────────────────────────────────────┘
                                       │
                                       └──▶ Analytics Engine
 ```
@@ -20,11 +20,11 @@ This is fully transparent to the client — any Sui SDK or gRPC-Web client works
 
 ## Features
 
-- **Request racing** — fan out to N backends, return the fastest response, abort the rest
+- **Smart backend selection** — tracks latency via EMA, races the top 3 backends with automatic fallback to the rest
 - **Edge caching** — immutable gRPC responses cached at Cloudflare's edge via Cache API + `cache-control: immutable`
 - **Header sanitization** — only gRPC protocol headers forwarded from backends, stripping node-specific and infrastructure headers
 - **Usage analytics** — logs every request to Cloudflare Analytics Engine with method, latency, geo, and cache status
-- **Latency endpoint** — `GET /latency` pings all backends and reports timing
+- **Health monitoring** — `GET /latency` probes all backends and returns health stats with pool assignments
 - **CORS** — browser-ready out of the box
 
 ## Caching
@@ -67,6 +67,29 @@ Cache hits are served directly from the Cloudflare edge datacenter with no backe
 
 Measured from `x-hayabusa-latency` header on `hayabusa.testnet.miso.network` (KIX datacenter → testnet fullnodes).
 
+## Backend Selection
+
+Hayabusa tracks backend health using an exponential moving average (EMA) of response latency and consecutive failure counts. Each backend gets a score:
+
+```
+score = ema_latency + consecutive_failures × 10s
+```
+
+Backends are sorted by score and split into two pools:
+
+- **Primary pool** — top 3 backends by score, raced on every request
+- **Fallback pool** — remaining backends, used only if the primary pool fails entirely
+
+This reduces fan-out from N to 3 while keeping all backends available as fallbacks. Stats are stored in-memory (global variables shared across requests within the same CF Worker isolate) and rebuilt automatically on cold start.
+
+### Health probing
+
+A background probe runs at most once every 30 seconds, triggered lazily by incoming requests via `waitUntil` (non-blocking). The probe pings all backends with `GetServiceInfo` and updates their EMA and failure stats. The `/latency` endpoint also triggers a synchronous probe and returns full health data.
+
+### Cold start
+
+When a fresh isolate has no stats, all backends are placed in the primary pool (races everyone). Stats converge within 1-2 requests.
+
 ## Response headers
 
 Every proxied response includes:
@@ -76,14 +99,15 @@ Every proxied response includes:
 | `x-hayabusa-backend` | SHA-256 hash (16 chars) of the winning backend URL (empty on cache hit) |
 | `x-hayabusa-latency` | Total proxy latency in milliseconds |
 | `x-hayabusa-cache` | `HIT` or `MISS` (only present on cacheable methods) |
+| `x-hayabusa-pool` | `primary` or `fallback` — which pool the winning backend came from |
 
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/` | Health check |
-| `GET` | `/latency` | Ping all backends, return sorted latency report |
-| `POST` | `/sui.rpc.v2.*` | gRPC-Web proxy (races all backends) |
+| `GET` | `/latency` | Probe all backends, return health stats with pool assignments |
+| `POST` | `/sui.rpc.v2.*` | gRPC-Web proxy (races primary pool, falls back to rest) |
 
 ## Setup
 

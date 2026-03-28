@@ -1,11 +1,69 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import pTimeout, { TimeoutError } from 'p-timeout';
-import pRetry from 'p-retry';
 import config from './config.json';
 
 const BACKEND_TIMEOUT_MS = 5_000;
-const RACE_RETRIES = 2;
+const POOL_SIZE = 3;
+const EMA_ALPHA = 0.3;
+const PROBE_INTERVAL_MS = 30_000;
+const FAILURE_PENALTY_MS = 10_000;
+
+// --- Backend health tracking (global, persists across requests in same isolate) ---
+
+interface BackendStats {
+	ema: number;
+	consecutiveFailures: number;
+	lastSuccessAt: number;
+	lastObservedAt: number;
+}
+
+const backendStats = new Map<string, BackendStats>();
+let lastProbeAt = 0;
+
+function backendScore(url: string): number {
+	const stats = backendStats.get(url);
+	if (!stats) return 0; // unknown → best score (encourages exploration)
+	return stats.ema + stats.consecutiveFailures * FAILURE_PENALTY_MS;
+}
+
+function selectPools(): { primary: string[]; fallback: string[] } {
+	// Cold start: race all backends to gather initial data
+	if (backendStats.size < config.backends.length) {
+		return { primary: config.backends, fallback: [] };
+	}
+	const sorted = [...config.backends].sort((a, b) => backendScore(a) - backendScore(b));
+	return {
+		primary: sorted.slice(0, POOL_SIZE),
+		fallback: sorted.slice(POOL_SIZE),
+	};
+}
+
+function updateWinnerStats(backend: string, latency: number): void {
+	const now = Date.now();
+	const stats = backendStats.get(backend);
+	if (stats) {
+		stats.ema = stats.ema * (1 - EMA_ALPHA) + latency * EMA_ALPHA;
+		stats.consecutiveFailures = 0;
+		stats.lastSuccessAt = now;
+		stats.lastObservedAt = now;
+	} else {
+		backendStats.set(backend, { ema: latency, consecutiveFailures: 0, lastSuccessAt: now, lastObservedAt: now });
+	}
+}
+
+function markPoolFailure(backends: string[]): void {
+	const now = Date.now();
+	for (const url of backends) {
+		const stats = backendStats.get(url);
+		if (stats) {
+			stats.consecutiveFailures++;
+			stats.lastObservedAt = now;
+		} else {
+			backendStats.set(url, { ema: BACKEND_TIMEOUT_MS, consecutiveFailures: 1, lastSuccessAt: 0, lastObservedAt: now });
+		}
+	}
+}
 
 // Only forward gRPC protocol headers from backends — strip node-specific and infrastructure headers
 const BACKEND_HEADER_ALLOWLIST = new Set([
@@ -67,58 +125,85 @@ app.use(
 			'x-hayabusa-backend',
 			'x-hayabusa-latency',
 			'x-hayabusa-cache',
+			'x-hayabusa-pool',
 		],
 	}),
 );
 
 app.get('/', (c) => c.text('hayabusa'));
 
-// Latency check — ping all backends with GetServiceInfo and report timing
-app.get('/latency', async (c) => {
-	const hashes = await getBackendHashes();
-
-	// Empty gRPC-Web frame for GetServiceInfo (no fields needed)
+// Probe all backends with GetServiceInfo and update health stats
+async function probeBackends(): Promise<void> {
 	const emptyFrame = new Uint8Array([0x00, 0x00, 0x00, 0x00, 0x00]);
+	const now = Date.now();
 
 	const results = await Promise.allSettled(
 		config.backends.map(async (backend) => {
 			const start = performance.now();
-			const res = await pTimeout(
+			await pTimeout(
 				fetch(`${backend}/sui.rpc.v2.LedgerService/GetServiceInfo`, {
 					method: 'POST',
-					headers: {
-						'content-type': 'application/grpc-web+proto',
-						accept: 'application/grpc-web+proto',
-					},
+					headers: { 'content-type': 'application/grpc-web+proto', accept: 'application/grpc-web+proto' },
 					body: emptyFrame,
 				}),
 				{ milliseconds: BACKEND_TIMEOUT_MS },
 			);
-			const latency = performance.now() - start;
-			return { id: hashes.get(backend)!, latency: Math.round(latency * 10) / 10, status: res.status };
+			return { backend, latency: performance.now() - start };
 		}),
 	);
 
-	const latencies = results.map((r) => {
-		if (r.status === 'fulfilled') return r.value;
-		const error = r.reason instanceof TimeoutError ? 'timeout' : (r.reason?.message ?? 'failed');
-		return { id: 'unknown', latency: null, status: null, error };
+	for (let i = 0; i < results.length; i++) {
+		const result = results[i];
+		const backend = config.backends[i];
+		if (result.status === 'fulfilled') {
+			updateWinnerStats(backend, result.value.latency);
+		} else {
+			const stats = backendStats.get(backend);
+			if (stats) {
+				stats.consecutiveFailures++;
+				stats.lastObservedAt = now;
+			} else {
+				backendStats.set(backend, { ema: BACKEND_TIMEOUT_MS, consecutiveFailures: 1, lastSuccessAt: 0, lastObservedAt: now });
+			}
+		}
+	}
+
+	lastProbeAt = now;
+}
+
+// Latency check — probe all backends, return health stats
+app.get('/latency', async (c) => {
+	await probeBackends();
+	const hashes = await getBackendHashes();
+	const { primary } = selectPools();
+	const primarySet = new Set(primary);
+
+	const backends = config.backends.map((url) => {
+		const stats = backendStats.get(url);
+		const hash = hashes.get(url)!;
+		return {
+			id: hash,
+			ema: stats ? Math.round(stats.ema * 10) / 10 : null,
+			consecutiveFailures: stats?.consecutiveFailures ?? 0,
+			score: Math.round(backendScore(url) * 10) / 10,
+			pool: primarySet.has(url) ? 'primary' : 'fallback',
+		};
 	});
 
-	// Sort by latency (fastest first), errors last
-	latencies.sort((a, b) => (a.latency ?? Infinity) - (b.latency ?? Infinity));
-
-	return c.json({ backends: latencies });
+	backends.sort((a, b) => a.score - b.score);
+	return c.json({ backends, probedAt: lastProbeAt });
 });
 
-// Race all backends, return first successful response
+// Race a subset of backends, return first successful response
 async function raceBackends(
+	backends: string[],
 	path: string,
 	headers: Headers,
 	body: ArrayBuffer,
-): Promise<{ res: Response; backend: string }> {
-	const controllers = config.backends.map(() => new AbortController());
-	const promises = config.backends.map((backend, i) =>
+): Promise<{ res: Response; backend: string; latency: number }> {
+	const start = performance.now();
+	const controllers = backends.map(() => new AbortController());
+	const promises = backends.map((backend, i) =>
 		pTimeout(
 			fetch(`${backend}${path}`, {
 				method: 'POST',
@@ -127,11 +212,10 @@ async function raceBackends(
 				signal: controllers[i].signal,
 			}).then((res) => {
 				if (!res.ok) throw new Error(`${backend} returned ${res.status}`);
-				// Abort all other in-flight requests
 				controllers.forEach((ctrl, j) => {
 					if (j !== i) ctrl.abort();
 				});
-				return { res, backend };
+				return { res, backend, latency: performance.now() - start };
 			}),
 			{ milliseconds: BACKEND_TIMEOUT_MS },
 		),
@@ -160,6 +244,13 @@ app.post('/sui.rpc.v2.*', async (c) => {
 
 	// Buffer request body so we can send it to multiple backends
 	const body = await c.req.arrayBuffer();
+
+	// --- Lazy health probe (non-blocking, at most once per interval) ---
+	const now = Date.now();
+	if (now - lastProbeAt > PROBE_INTERVAL_MS) {
+		lastProbeAt = now;
+		c.executionCtx.waitUntil(probeBackends());
+	}
 
 	// --- Cache layer ---
 	const cacheCheck = CACHE_CHECKS.get(path);
@@ -217,18 +308,34 @@ app.post('/sui.rpc.v2.*', async (c) => {
 		}
 	}
 
-	// Race with retries — if all backends fail, retry the whole fan-out
+	// Two-stage racing: primary pool (top N by health) → fallback pool
+	const { primary, fallback } = selectPools();
 	let backendRes: Response;
 	let winningBackend: string;
+	let pool: 'primary' | 'fallback' = 'primary';
+
 	try {
-		const winner = await pRetry(() => raceBackends(path, forwardHeaders, body), {
-			retries: RACE_RETRIES,
-			minTimeout: 0,
-		});
+		const winner = await raceBackends(primary, path, forwardHeaders, body);
 		backendRes = winner.res;
 		winningBackend = winner.backend;
+		updateWinnerStats(winner.backend, winner.latency);
 	} catch {
-		return c.text('All backends failed', 502);
+		markPoolFailure(primary);
+
+		if (fallback.length > 0) {
+			try {
+				pool = 'fallback';
+				const winner = await raceBackends(fallback, path, forwardHeaders, body);
+				backendRes = winner.res;
+				winningBackend = winner.backend;
+				updateWinnerStats(winner.backend, winner.latency);
+			} catch {
+				markPoolFailure(fallback);
+				return c.text('All backends failed', 502);
+			}
+		} else {
+			return c.text('All backends failed', 502);
+		}
 	}
 
 	const latency = performance.now() - start;
@@ -271,6 +378,7 @@ app.post('/sui.rpc.v2.*', async (c) => {
 	}
 	resHeaders.set('x-hayabusa-backend', backendHash);
 	resHeaders.set('x-hayabusa-latency', latency.toFixed(1));
+	resHeaders.set('x-hayabusa-pool', pool);
 
 	// Cache immutable responses (only successful gRPC status)
 	if (isCacheable) {
