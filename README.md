@@ -41,7 +41,7 @@ Since gRPC-Web uses POST requests, browser caching and Cloudflare's CDN cache ar
 
 ### Cached methods
 
-**Tier 1 — always immutable** (no request inspection needed):
+**Layer 1 — always immutable** (no request inspection needed):
 
 | Method | Why immutable |
 |--------|--------------|
@@ -51,14 +51,14 @@ Since gRPC-Web uses POST requests, browser caching and Cloudflare's CDN cache ar
 | `MovePackageService/GetDatatype` | Datatype definitions within a package never change |
 | `MovePackageService/GetFunction` | Function definitions within a package never change |
 
-**Tier 2 — conditionally immutable** (inspects protobuf request body):
+**Layer 2 — conditionally immutable** (inspects protobuf request body):
 
 | Method | Cached when |
 |--------|------------|
 | `LedgerService/GetObject` | `version` field is set (object at a specific version is frozen) |
 | `LedgerService/GetCheckpoint` | `sequence_number` or `digest` is provided (not "latest") |
 
-Tier 2 uses a minimal protobuf wire format scanner (~30 lines, zero dependencies) to check for the presence of version-pinning fields. Only successful gRPC responses (`grpc-status: 0`) are cached. Errors are never stored.
+Layer 2 uses a minimal protobuf wire format scanner (~30 lines, zero dependencies) to check for the presence of version-pinning fields. Only successful gRPC responses (`grpc-status: 0`) are cached. Errors are never stored.
 
 ## Backend Selection
 
