@@ -665,31 +665,63 @@ app.post('/sui.rpc.v2.*', async (c) => {
 	resHeaders.set('x-hayabusa-pool', pool);
 	resHeaders.set('x-hayabusa-fanout', String(backendsLaunched));
 
-	// For native gRPC, read full body and append trailers as a gRPC-web trailer frame.
-	// CF Workers exposes HTTP/2 trailers as regular response headers.
+	// For native gRPC, convert to gRPC-web format:
+	// 1. Decompress any gzip-compressed data frames (flag 0x01)
+	// 2. Append trailers as a gRPC-web trailer frame (flag 0x80)
 	let responseBody: ArrayBuffer | ReadableStream<Uint8Array> | null = backendRes.body;
 	if (isNativeGrpc) {
-		const dataBody = await backendRes.arrayBuffer();
+		const rawBody = new Uint8Array(await backendRes.arrayBuffer());
+
+		// Parse gRPC frames and decompress any compressed ones
+		const outputFrames: Uint8Array[] = [];
+		let pos = 0;
+		while (pos + 5 <= rawBody.length) {
+			const flag = rawBody[pos];
+			const len = new DataView(rawBody.buffer, rawBody.byteOffset + pos + 1, 4).getUint32(0);
+			if (pos + 5 + len > rawBody.length) break;
+			const frameData = rawBody.slice(pos + 5, pos + 5 + len);
+
+			if (flag === 0x01) {
+				// Compressed frame — decompress and rewrite as uncompressed (0x00)
+				const encoding = backendRes.headers.get('grpc-encoding') ?? 'gzip';
+				const decompressed = await new Response(
+					new Blob([frameData]).stream().pipeThrough(new DecompressionStream(encoding as CompressionFormat)),
+				).arrayBuffer();
+				const header = new Uint8Array(5);
+				header[0] = 0x00; // uncompressed
+				new DataView(header.buffer).setUint32(1, decompressed.byteLength);
+				outputFrames.push(header);
+				outputFrames.push(new Uint8Array(decompressed));
+			} else {
+				// Uncompressed frame — pass through as-is
+				outputFrames.push(rawBody.slice(pos, pos + 5 + len));
+			}
+			pos += 5 + len;
+		}
+
+		// Build trailer frame from response headers
 		const grpcStatus = backendRes.headers.get('grpc-status') ?? '0';
 		const grpcMessage = backendRes.headers.get('grpc-message') ?? '';
-
 		let trailerText = `grpc-status:${grpcStatus}\r\n`;
 		if (grpcMessage) trailerText += `grpc-message:${grpcMessage}\r\n`;
-
 		const trailerBytes = new TextEncoder().encode(trailerText);
 		const trailerFrame = new Uint8Array(5 + trailerBytes.length);
 		trailerFrame[0] = 0x80; // trailer flag
 		new DataView(trailerFrame.buffer).setUint32(1, trailerBytes.length);
 		trailerFrame.set(trailerBytes, 5);
+		outputFrames.push(trailerFrame);
 
-		const merged = new Uint8Array(dataBody.byteLength + trailerFrame.length);
-		merged.set(new Uint8Array(dataBody), 0);
-		merged.set(trailerFrame, dataBody.byteLength);
+		// Merge all frames
+		const totalLen = outputFrames.reduce((s, f) => s + f.length, 0);
+		const merged = new Uint8Array(totalLen);
+		let offset = 0;
+		for (const frame of outputFrames) { merged.set(frame, offset); offset += frame.length; }
 		responseBody = merged.buffer;
 
-		// Remove grpc trailers from headers (now embedded in body)
+		// Strip compression headers and grpc trailers (now embedded in body)
 		resHeaders.delete('grpc-status');
 		resHeaders.delete('grpc-message');
+		resHeaders.delete('grpc-encoding');
 	}
 
 	// Cache immutable responses (only successful gRPC status)
