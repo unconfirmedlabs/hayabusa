@@ -344,6 +344,10 @@ async function raceBackends(
 				signal: controllers[i].signal,
 			}).then((res) => {
 				if (!res.ok) throw new Error(`${backends[i]} returned ${res.status}`);
+				// Reject gRPC errors — backends return HTTP 200 with grpc-status in headers
+				// for trailers-only error responses (e.g. UNAVAILABLE from regional routing)
+				const grpcStatus = res.headers.get('grpc-status');
+				if (grpcStatus && grpcStatus !== '0') throw new Error(`${backends[i]} grpc-status ${grpcStatus}`);
 				settled = true;
 				controllers.forEach((ctrl, j) => {
 					if (j !== i) ctrl.abort();
