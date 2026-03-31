@@ -683,9 +683,21 @@ app.post('/sui.rpc.v2.*', async (c) => {
 
 			if (flag === 0x01) {
 				// Compressed frame — decompress and rewrite as uncompressed (0x00)
-				const encoding = backendRes.headers.get('grpc-encoding') ?? 'gzip';
+				// gRPC uses grpc-encoding header: gzip, deflate, deflate-raw, snappy, zstd
+				// DecompressionStream supports: gzip, deflate, deflate-raw
+				const grpcEncoding = backendRes.headers.get('grpc-encoding') ?? 'gzip';
+				const dsFormat = grpcEncoding === 'gzip' ? 'gzip'
+					: grpcEncoding === 'deflate' ? 'deflate'
+					: grpcEncoding === 'deflate-raw' ? 'deflate-raw'
+					: null;
+				if (!dsFormat) {
+					// Unsupported compression (snappy, zstd) — pass through compressed
+					outputFrames.push(rawBody.slice(pos, pos + 5 + len));
+					pos += 5 + len;
+					continue;
+				}
 				const decompressed = await new Response(
-					new Blob([frameData]).stream().pipeThrough(new DecompressionStream(encoding as CompressionFormat)),
+					new Blob([frameData]).stream().pipeThrough(new DecompressionStream(dsFormat)),
 				).arrayBuffer();
 				const header = new Uint8Array(5);
 				header[0] = 0x00; // uncompressed
