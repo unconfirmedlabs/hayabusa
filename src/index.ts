@@ -578,6 +578,15 @@ app.post('/sui.rpc.v2.*', async (c) => {
 	for (const [key, value] of backendRes.headers) {
 		if (BACKEND_HEADER_ALLOWLIST.has(key)) resHeaders.set(key, value);
 	}
+
+	// Normalize content-type: some fullnodes return application/grpc instead
+	// of application/grpc-web, which grpc-web clients reject
+	const ct = resHeaders.get('content-type');
+	if (ct === 'application/grpc') {
+		resHeaders.set('content-type', 'application/grpc-web');
+	} else if (ct === 'application/grpc+proto') {
+		resHeaders.set('content-type', 'application/grpc-web+proto');
+	}
 	resHeaders.set('x-hayabusa-backend', backendHash);
 	resHeaders.set('x-hayabusa-latency', latency.toFixed(1));
 	resHeaders.set('x-hayabusa-pool', pool);
@@ -603,7 +612,7 @@ app.post('/sui.rpc.v2.*', async (c) => {
 				const kvKey = cacheKey.slice('https://hayabusa-cache'.length);
 				const metadata: Record<string, string> = {};
 				for (const key of BACKEND_HEADER_ALLOWLIST) {
-					const val = backendRes.headers.get(key);
+					const val = resHeaders.get(key);
 					if (val) metadata[key] = val;
 				}
 				c.executionCtx.waitUntil(c.env.CACHE_KV.put(kvKey, cachedBody, { metadata, expirationTtl: 30 * 86400 }));
