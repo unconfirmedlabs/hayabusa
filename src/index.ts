@@ -579,26 +579,60 @@ app.post('/sui.rpc.v2.*', async (c) => {
 		if (BACKEND_HEADER_ALLOWLIST.has(key)) resHeaders.set(key, value);
 	}
 
-	// Normalize content-type: some fullnodes return application/grpc instead
-	// of application/grpc-web, which grpc-web clients reject
+	// Convert native gRPC responses to gRPC-web format.
+	// Some fullnodes return application/grpc (native gRPC over HTTP/2) instead of
+	// application/grpc-web. Native gRPC sends trailers as HTTP/2 trailing headers,
+	// while gRPC-web embeds trailers as a frame in the response body.
 	const ct = resHeaders.get('content-type');
-	if (ct === 'application/grpc') {
-		resHeaders.set('content-type', 'application/grpc-web');
-	} else if (ct === 'application/grpc+proto') {
-		resHeaders.set('content-type', 'application/grpc-web+proto');
+	const isNativeGrpc = ct === 'application/grpc' || ct === 'application/grpc+proto';
+
+	if (isNativeGrpc) {
+		resHeaders.set('content-type', ct === 'application/grpc+proto' ? 'application/grpc-web+proto' : 'application/grpc-web');
 	}
+
 	resHeaders.set('x-hayabusa-backend', backendHash);
 	resHeaders.set('x-hayabusa-latency', latency.toFixed(1));
 	resHeaders.set('x-hayabusa-pool', pool);
 	resHeaders.set('x-hayabusa-fanout', String(backendsLaunched));
 
+	// For native gRPC, read full body and append trailers as a gRPC-web trailer frame.
+	// CF Workers exposes HTTP/2 trailers as regular response headers.
+	let responseBody: ArrayBuffer | ReadableStream<Uint8Array> | null = backendRes.body;
+	if (isNativeGrpc) {
+		const dataBody = await backendRes.arrayBuffer();
+		const grpcStatus = backendRes.headers.get('grpc-status') ?? '0';
+		const grpcMessage = backendRes.headers.get('grpc-message') ?? '';
+
+		let trailerText = `grpc-status:${grpcStatus}\r\n`;
+		if (grpcMessage) trailerText += `grpc-message:${grpcMessage}\r\n`;
+
+		const trailerBytes = new TextEncoder().encode(trailerText);
+		const trailerFrame = new Uint8Array(5 + trailerBytes.length);
+		trailerFrame[0] = 0x80; // trailer flag
+		new DataView(trailerFrame.buffer).setUint32(1, trailerBytes.length);
+		trailerFrame.set(trailerBytes, 5);
+
+		const merged = new Uint8Array(dataBody.byteLength + trailerFrame.length);
+		merged.set(new Uint8Array(dataBody), 0);
+		merged.set(trailerFrame, dataBody.byteLength);
+		responseBody = merged.buffer;
+
+		// Remove grpc trailers from headers (now embedded in body)
+		resHeaders.delete('grpc-status');
+		resHeaders.delete('grpc-message');
+	}
+
 	// Cache immutable responses (only successful gRPC status)
 	if (isCacheable) {
 		resHeaders.set('x-hayabusa-cache', 'MISS');
 
-		const grpcStatusVal = backendRes.headers.get('grpc-status');
+		const grpcStatusVal = isNativeGrpc
+			? (backendRes.headers.get('grpc-status') ?? '0')
+			: backendRes.headers.get('grpc-status');
 		if (!grpcStatusVal || grpcStatusVal === '0') {
-			const cachedBody = await backendRes.clone().arrayBuffer();
+			const cachedBody = isNativeGrpc
+				? (responseBody as ArrayBuffer)
+				: await backendRes.clone().arrayBuffer();
 
 			// L1: Cache API (per-colo)
 			const cacheRes = new Response(cachedBody, {
@@ -620,7 +654,7 @@ app.post('/sui.rpc.v2.*', async (c) => {
 		}
 	}
 
-	return new Response(backendRes.body, {
+	return new Response(responseBody, {
 		status: backendRes.status,
 		headers: resHeaders,
 	});
