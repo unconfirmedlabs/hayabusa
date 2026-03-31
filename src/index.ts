@@ -320,6 +320,72 @@ app.get('/cache', async (c) => {
 	});
 });
 
+// Debug endpoint — test each backend individually and report raw response details
+app.get('/debug/backends', async (c) => {
+	// GetTransaction with a known digest (Sui framework genesis tx)
+	// Build a minimal gRPC-web request frame for GetServiceInfo (empty message)
+	const emptyFrame = new Uint8Array([0x00, 0x00, 0x00, 0x00, 0x00]);
+	const path = '/sui.rpc.v2.LedgerService/GetServiceInfo';
+	const hashes = await getBackendHashes();
+
+	const results = await Promise.allSettled(
+		config.backends.map(async (backend) => {
+			const hash = hashes.get(backend) ?? 'unknown';
+			const start = performance.now();
+			const res = await pTimeout(
+				fetch(`${backend}${path}`, {
+					method: 'POST',
+					headers: {
+						'content-type': 'application/grpc-web+proto',
+						accept: 'application/grpc-web+proto',
+						'x-grpc-web': '1',
+					},
+					body: emptyFrame,
+				}),
+				{ milliseconds: 5000 },
+			);
+			const latency = performance.now() - start;
+			const body = await res.arrayBuffer();
+			const bytes = new Uint8Array(body);
+
+			// Check if body has a trailer frame (0x80)
+			let hasTrailer = false;
+			let pos = 0;
+			while (pos + 5 <= bytes.length) {
+				const flag = bytes[pos];
+				const len = new DataView(body, pos + 1, 4).getUint32(0);
+				if (flag === 0x80) { hasTrailer = true; break; }
+				pos += 5 + len;
+			}
+
+			// Collect all response headers
+			const headers: Record<string, string> = {};
+			for (const [k, v] of res.headers) headers[k] = v;
+
+			return {
+				backend: hash,
+				url: backend,
+				status: res.status,
+				latencyMs: Math.round(latency * 10) / 10,
+				contentType: res.headers.get('content-type'),
+				grpcStatus: res.headers.get('grpc-status'),
+				bodyLength: body.byteLength,
+				bodyFirst8: [...bytes.slice(0, 8)].map(b => b.toString(16).padStart(2, '0')).join(' '),
+				hasTrailerFrame: hasTrailer,
+				headers,
+			};
+		}),
+	);
+
+	const cf = c.req.raw.cf;
+	return c.json({
+		colo: (cf?.colo as string) ?? 'unknown',
+		results: results.map((r, i) =>
+			r.status === 'fulfilled' ? r.value : { backend: hashes.get(config.backends[i]) ?? 'unknown', url: config.backends[i], error: r.reason?.message ?? 'unknown' }
+		),
+	});
+});
+
 // Race backends with hedged requests: fire the best backend first, only fan out
 // if it's slow. Reduces duplicate origin load while preserving tail latency.
 async function raceBackends(
